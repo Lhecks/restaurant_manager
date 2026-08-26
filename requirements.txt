@@ -1,0 +1,8 @@
+# Runtime dependencies
+# tkinter and sqlite3 are part of the Python standard library — nothing to
+# install for those. The Analysis tab needs the two below.
+matplotlib>=3.8
+reportlab>=4.0
+
+# Development / testing dependencies
+pytest>=8.0
