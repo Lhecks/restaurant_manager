@@ -9,6 +9,7 @@ a clean slate and nothing touches disk or a real restaurant.db file.
 
 import sys
 import os
+from datetime import datetime
 
 # Allow "import database" when running pytest from the project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -384,3 +385,142 @@ def test_customer_segment_becomes_regular_past_threshold(db):
 
     report = db.customer_spending_report()
     assert report[0].segment == "Regular"
+
+
+# ------------------------------------------------------------------
+# Table names
+# ------------------------------------------------------------------
+def test_add_table_with_name(db):
+    db.add_table(1, 20, "Family")
+    table = db.list_tables()[0]
+    assert table.number == 1
+    assert table.capacity == 20
+    assert table.name == "Family"
+
+
+def test_table_name_is_optional(db):
+    db.add_table(1, 4)
+    table = db.list_tables()[0]
+    assert table.name is None
+
+
+def test_update_table_name(db):
+    table_id = db.add_table(1, 20, "Family")
+    db.update_table(table_id, 1, 20, "Banquet")
+    assert db.list_tables()[0].name == "Banquet"
+
+
+# ------------------------------------------------------------------
+# Duplicate menu item names (case-insensitive)
+# ------------------------------------------------------------------
+def test_duplicate_menu_item_name_raises(db):
+    db.add_menu_item("Pizza", 10.0)
+    with pytest.raises(ValueError):
+        db.add_menu_item("pizza", 12.0)  # different case, still a duplicate
+
+
+def test_duplicate_menu_item_name_on_update_raises(db):
+    db.add_menu_item("Pizza", 10.0)
+    beer_id = db.add_menu_item("Beer", 4.0, category="Drink")
+    with pytest.raises(ValueError):
+        db.update_menu_item(beer_id, "PIZZA", 5.0, new_category="Drink")
+
+
+def test_list_categories(db):
+    db.add_menu_item("Pizza", 10.0, category="Food")
+    db.add_menu_item("Beer", 4.0, category="Drink")
+    db.add_menu_item("Tiramisu", 6.0, category="Dessert")
+    assert db.list_categories() == ["Dessert", "Drink", "Food"]
+
+
+# ------------------------------------------------------------------
+# Date-range filtering on analysis queries
+# ------------------------------------------------------------------
+def test_customer_spending_report_with_date_range_excludes_out_of_range_orders(db):
+    alice = db.add_customer("Alice", "+242060000001")
+    item_id = db.add_menu_item("Pizza", 10.0)
+    db.add_order(alice, item_id, 2)  # placed "now"
+
+    # A range that doesn't include today should show 0 orders for Alice
+    report = db.customer_spending_report("2000-01-01", "2000-01-31")
+    assert report[0].order_count == 0
+    assert report[0].total_spent == 0
+
+
+def test_customer_spending_report_with_date_range_includes_in_range_orders(db):
+    alice = db.add_customer("Alice", "+242060000001")
+    item_id = db.add_menu_item("Pizza", 10.0)
+    db.add_order(alice, item_id, 2)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    report = db.customer_spending_report(today, today)
+    assert report[0].order_count == 1
+    assert report[0].total_spent == 20.0
+
+
+def test_top_selling_items_with_date_range(db):
+    alice = db.add_customer("Alice")
+    item_id = db.add_menu_item("Pizza", 10.0, category="Food")
+    db.add_order(alice, item_id, 3)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    in_range = db.top_selling_items(category="Food", start_date=today, end_date=today)
+    assert in_range[0].quantity_sold == 3
+
+    out_of_range = db.top_selling_items(category="Food", start_date="2000-01-01", end_date="2000-01-31")
+    assert out_of_range[0].quantity_sold == 0
+
+
+def test_revenue_for_period(db):
+    alice = db.add_customer("Alice")
+    item_id = db.add_menu_item("Pizza", 10.0)
+    db.add_order(alice, item_id, 2)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert db.revenue_for_period(today, today) == 20.0
+    assert db.revenue_for_period("2000-01-01", "2000-01-31") == 0
+
+
+# ------------------------------------------------------------------
+# Configurable settings (Regular customer threshold)
+# ------------------------------------------------------------------
+def test_default_regular_customer_threshold(db):
+    from database import REGULAR_CUSTOMER_ORDER_THRESHOLD
+    assert db.get_regular_customer_threshold() == REGULAR_CUSTOMER_ORDER_THRESHOLD
+
+
+def test_set_and_get_regular_customer_threshold(db):
+    db.set_regular_customer_threshold(3)
+    assert db.get_regular_customer_threshold() == 3
+
+
+def test_set_regular_customer_threshold_rejects_zero_or_negative(db):
+    with pytest.raises(ValueError):
+        db.set_regular_customer_threshold(0)
+    with pytest.raises(ValueError):
+        db.set_regular_customer_threshold(-1)
+
+
+def test_regular_customer_threshold_affects_segment(db):
+    alice = db.add_customer("Alice", "+242060000001")
+    item_id = db.add_menu_item("Pizza", 10.0)
+    for _ in range(3):
+        db.add_order(alice, item_id, 1)
+
+    # With the default threshold (5), 3 orders isn't enough to be "Regular"
+    assert db.customer_spending_report()[0].segment == "Occasional"
+
+    # Lower the threshold to 3, and the same customer becomes "Regular"
+    db.set_regular_customer_threshold(3)
+    assert db.customer_spending_report()[0].segment == "Regular"
+
+
+def test_setting_persists_across_database_instances(tmp_path):
+    db_path = str(tmp_path / "test_settings.db")
+    db1 = Database(db_path)
+    db1.set_regular_customer_threshold(7)
+    db1.close()
+
+    db2 = Database(db_path)
+    assert db2.get_regular_customer_threshold() == 7
+    db2.close()

@@ -56,6 +56,7 @@ class Table:
     id: int
     number: int
     capacity: int
+    name: str | None = None  # e.g. "Family", "Couple", "VIP" — an optional nickname alongside the number
 
 
 @dataclass
@@ -83,10 +84,7 @@ class CustomerSpending:
     order_count: int
     items_count: int
     total_spent: float
-
-    @property
-    def segment(self) -> str:
-        return "Regular" if self.order_count >= REGULAR_CUSTOMER_ORDER_THRESHOLD else "Occasional"
+    segment: str = "Occasional"
 
 
 @dataclass
@@ -201,12 +199,13 @@ class Database:
             FOREIGN KEY(menu_item_id) REFERENCES menu_items(id) ON DELETE CASCADE
         )""")
 
-        # TABLE: physical restaurant tables (table #4, seats 6, etc.)
+        # TABLE: physical restaurant tables (table #4, seats 6, name "Family", etc.)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS tables(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             number INTEGER NOT NULL UNIQUE,
-            capacity INTEGER NOT NULL
+            capacity INTEGER NOT NULL,
+            name TEXT
         )""")
 
         # TABLE: reservations — links a customer to a physical table at a
@@ -222,6 +221,15 @@ class Database:
             guests INTEGER NOT NULL,
             FOREIGN KEY(table_id) REFERENCES tables(id) ON DELETE CASCADE,
             FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
+        )""")
+
+        # TABLE: simple key/value settings store, so options like the
+        # "Regular customer" order threshold can be changed from the UI
+        # and persist across restarts, instead of being a hardcoded constant.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )""")
 
         self.conn.commit()
@@ -297,8 +305,63 @@ class Database:
             )
             self.conn.commit()
 
+        # ------------------------------------------------------------
+        # MIGRATION: add an optional nickname to tables (e.g. "Family",
+        # "Couple", "VIP") alongside the existing table number.
+        # ------------------------------------------------------------
+        cursor.execute("PRAGMA table_info(tables)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "name" not in existing_columns:
+            cursor.execute("ALTER TABLE tables ADD COLUMN name TEXT")
+            self.conn.commit()
+
+        # UNIQUE INDEX (case-insensitive) on menu item names, so "Pizza" and
+        # "pizza" are treated as the same dish and can't both be added.
+        # Wrapped in try/except: if an existing database already has
+        # duplicate names from before this feature existed, creating the
+        # index would fail outright — better to warn and skip than to
+        # crash the whole app on startup.
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_menu_items_name ON menu_items(name COLLATE NOCASE)"
+            )
+        except sqlite3.IntegrityError:
+            print(
+                "[Warning] Could not enforce unique menu item names — your "
+                "menu already has duplicate names from before this feature "
+                "existed. Rename or remove the duplicates, then restart the "
+                "app to enable duplicate prevention."
+            )
+
     def close(self) -> None:
         self.conn.close()
+
+    # ------------------------------------------------------------------
+    # Settings (simple key/value store, persisted in app_settings)
+    # ------------------------------------------------------------------
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def get_regular_customer_threshold(self) -> int:
+        """Minimum number of orders for a customer to be tagged 'Regular' instead of 'Occasional'."""
+        return int(self.get_setting("regular_customer_threshold", str(REGULAR_CUSTOMER_ORDER_THRESHOLD)))
+
+    def set_regular_customer_threshold(self, threshold: int) -> None:
+        if threshold < 1:
+            raise ValueError("The Regular customer threshold must be at least 1.")
+        self.set_setting("regular_customer_threshold", str(threshold))
 
     # ------------------------------------------------------------------
     # Customers
@@ -341,10 +404,13 @@ class Database:
     # ------------------------------------------------------------------
     def add_menu_item(self, name: str, price: float, category: str = "Food") -> int:
         cursor = self.conn.cursor()
-        cursor.execute(
-            "INSERT INTO menu_items(name, price, category) VALUES (?, ?, ?)",
-            (name, price, category),
-        )
+        try:
+            cursor.execute(
+                "INSERT INTO menu_items(name, price, category) VALUES (?, ?, ?)",
+                (name, price, category),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"'{name}' already exists on the menu (names must be unique, case-insensitive).") from e
         self.conn.commit()
         return cursor.lastrowid
 
@@ -353,12 +419,21 @@ class Database:
         cursor.execute("SELECT id, name, price, category FROM menu_items ORDER BY category, name")
         return [MenuItem(*row) for row in cursor.fetchall()]
 
+    def list_categories(self) -> list[str]:
+        """Distinct categories currently used by at least one menu item, e.g. ['Appetizer', 'Dessert', 'Drink', 'Food']."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT DISTINCT category FROM menu_items ORDER BY category")
+        return [row[0] for row in cursor.fetchall()]
+
     def update_menu_item(self, item_id: int, new_name: str, new_price: float, new_category: str = "Food") -> None:
         cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE menu_items SET name = ?, price = ?, category = ? WHERE id = ?",
-            (new_name, new_price, new_category, item_id),
-        )
+        try:
+            cursor.execute(
+                "UPDATE menu_items SET name = ?, price = ?, category = ? WHERE id = ?",
+                (new_name, new_price, new_category, item_id),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"'{new_name}' already exists on the menu (names must be unique, case-insensitive).") from e
         self.conn.commit()
 
     def delete_menu_item(self, item_id: int) -> None:
@@ -480,22 +555,22 @@ class Database:
     # ------------------------------------------------------------------
     # Tables (the physical restaurant tables, not SQL tables!)
     # ------------------------------------------------------------------
-    def add_table(self, number: int, capacity: int) -> int:
+    def add_table(self, number: int, capacity: int, name: str | None = None) -> int:
         cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO tables(number, capacity) VALUES (?, ?)", (number, capacity))
+        cursor.execute("INSERT INTO tables(number, capacity, name) VALUES (?, ?, ?)", (number, capacity, name))
         self.conn.commit()
         return cursor.lastrowid
 
     def list_tables(self) -> list[Table]:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, number, capacity FROM tables ORDER BY number")
+        cursor.execute("SELECT id, number, capacity, name FROM tables ORDER BY number")
         return [Table(*row) for row in cursor.fetchall()]
 
-    def update_table(self, table_id: int, number: int, capacity: int) -> None:
+    def update_table(self, table_id: int, number: int, capacity: int, name: str | None = None) -> None:
         cursor = self.conn.cursor()
         cursor.execute(
-            "UPDATE tables SET number = ?, capacity = ? WHERE id = ?",
-            (number, capacity, table_id),
+            "UPDATE tables SET number = ?, capacity = ?, name = ? WHERE id = ?",
+            (number, capacity, name, table_id),
         )
         self.conn.commit()
 
@@ -552,11 +627,17 @@ class Database:
     # ------------------------------------------------------------------
     # Analysis
     # ------------------------------------------------------------------
-    def customer_spending_report(self) -> list[CustomerSpending]:
+    def customer_spending_report(self, start_date: str | None = None, end_date: str | None = None) -> list[CustomerSpending]:
         """
         Aggregates every order by customer phone number: how many separate
         orders they placed, how many items in total, and how much they've
         spent overall. Sorted with the biggest spenders first.
+
+        If start_date/end_date are given (as 'YYYY-MM-DD' strings, inclusive
+        on both ends), only orders placed within that range are counted.
+        Customers are still listed even if they have zero orders in that
+        range (the date filter is applied inside the JOIN, not as a WHERE,
+        so it doesn't turn this into an inner join).
 
         Grouping is done on phone_number (per the requirement that the same
         person should be recognized across visits by their number) rather
@@ -565,9 +646,19 @@ class Database:
         keeps the analysis meaningful even if that assumption ever changes.
         Customers with no phone number on file are grouped together under
         "No phone number" so they don't silently disappear from the report.
+
+        Each row's `segment` ("Regular" vs "Occasional") is computed using
+        the currently configured threshold (see get_regular_customer_threshold()
+        / set_regular_customer_threshold()), not a hardcoded constant.
         """
         cursor = self.conn.cursor()
-        cursor.execute("""
+        date_filter = ""
+        params: list = []
+        if start_date and end_date:
+            date_filter = "AND date(orders.created_at) BETWEEN ? AND ?"
+            params = [start_date, end_date]
+
+        cursor.execute(f"""
             SELECT
                 COALESCE(customers.phone_number, 'No phone number') AS phone,
                 GROUP_CONCAT(DISTINCT customers.name) AS names,
@@ -575,30 +666,45 @@ class Database:
                 COALESCE(SUM(orders.quantity), 0) AS items_count,
                 COALESCE(SUM(orders.quantity * menu_items.price), 0) AS total_spent
             FROM customers
-            LEFT JOIN orders ON orders.customer_id = customers.id
+            LEFT JOIN orders ON orders.customer_id = customers.id {date_filter}
             LEFT JOIN menu_items ON orders.menu_item_id = menu_items.id
             GROUP BY phone
             ORDER BY total_spent DESC
-        """)
-        return [CustomerSpending(*row) for row in cursor.fetchall()]
+        """, params)
 
-    def top_selling_items(self, category: str | None = None, limit: int = 10) -> list[ItemSales]:
+        threshold = self.get_regular_customer_threshold()
+        rows = []
+        for phone, names, order_count, items_count, total_spent in cursor.fetchall():
+            segment = "Regular" if order_count >= threshold else "Occasional"
+            rows.append(CustomerSpending(phone, names, order_count, items_count, total_spent, segment))
+        return rows
+
+    def top_selling_items(
+        self, category: str | None = None, limit: int = 10,
+        start_date: str | None = None, end_date: str | None = None,
+    ) -> list[ItemSales]:
         """
-        Ranks menu items by total quantity sold (across every order ever
-        placed), optionally restricted to one category ("Food" or "Drink").
-        Pass category=None to rank across both at once.
+        Ranks menu items by total quantity sold, optionally restricted to
+        one category and/or a 'YYYY-MM-DD' date range (inclusive both ends).
+        Pass category=None to rank across every category at once.
         """
         cursor = self.conn.cursor()
-        query = """
+        date_filter = ""
+        join_params: list = []
+        if start_date and end_date:
+            date_filter = "AND date(orders.created_at) BETWEEN ? AND ?"
+            join_params = [start_date, end_date]
+
+        query = f"""
             SELECT
                 menu_items.name,
                 menu_items.category,
                 COALESCE(SUM(orders.quantity), 0) AS quantity_sold,
                 COALESCE(SUM(orders.quantity * menu_items.price), 0) AS revenue
             FROM menu_items
-            LEFT JOIN orders ON orders.menu_item_id = menu_items.id
+            LEFT JOIN orders ON orders.menu_item_id = menu_items.id {date_filter}
         """
-        params: list = []
+        params = list(join_params)
         if category is not None:
             query += " WHERE menu_items.category = ?"
             params.append(category)
@@ -607,3 +713,14 @@ class Database:
 
         cursor.execute(query, params)
         return [ItemSales(*row) for row in cursor.fetchall()]
+
+    def revenue_for_period(self, start_date: str, end_date: str) -> float:
+        """Sum of (price * quantity) for orders placed within ['YYYY-MM-DD', 'YYYY-MM-DD'] inclusive."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT COALESCE(SUM(menu_items.price * orders.quantity), 0)
+            FROM orders
+            INNER JOIN menu_items ON orders.menu_item_id = menu_items.id
+            WHERE date(orders.created_at) BETWEEN ? AND ?
+        """, (start_date, end_date))
+        return cursor.fetchone()[0]

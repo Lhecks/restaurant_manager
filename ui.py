@@ -10,14 +10,16 @@ SQL itself, which keeps the interface and the data layer independent
 
 import re
 import csv
+import calendar
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkcalendar import Calendar
 
 from database import Database
 
@@ -39,6 +41,16 @@ TEXT_MUTED = "#ADB5BD"
 PHONE_PATTERN = re.compile(r"^\+242\d{9}$")
 PHONE_FORMAT_HINT = "+242XXXXXXXXX (Congo format: +242 followed by 9 digits)"
 
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+# Minimum notice required before a reservation's date/time — blocks booking
+# a table for "right now" or for a slot that's already passed. Change this
+# if your restaurant needs a different lead time.
+MIN_BOOKING_LEAD_TIME = timedelta(hours=2)
+
 
 def is_valid_phone(phone: str) -> bool:
     cleaned = phone.replace(" ", "").replace("-", "")
@@ -48,6 +60,128 @@ def is_valid_phone(phone: str) -> bool:
 def clean_phone(phone: str) -> str:
     """Normalizes a phone number to the compact +242XXXXXXXXX form for storage."""
     return phone.replace(" ", "").replace("-", "")
+
+
+class SimpleDatePicker(tk.Frame):
+    """
+    A drop-in replacement for tkcalendar.DateEntry's basic API
+    (.get(), .get_date(), .set_date()) that avoids a known upstream bug:
+    DateEntry's built-in dropdown popup auto-closes on <FocusOut>, and
+    clicking its own month/year navigation arrows can trigger a focus
+    shift that gets misread as "clicked outside the popup" — closing the
+    calendar instead of navigating to the next month/year
+    (see tkcalendar issues #41 / #44 on GitHub).
+
+    This widget sidesteps the bug entirely by opening the Calendar in a
+    Toplevel window that WE control: it only closes when the person
+    clicks "Select" (or the window's own close button), never based on
+    focus changes. The month/year arrows are then just normal clicks
+    inside that Toplevel, with nothing set up to misinterpret them.
+    """
+
+    def __init__(self, parent, date_pattern="%d/%m/%Y", width=11, initial_date=None, mindate=None):
+        super().__init__(parent, bg=BG_COLOR)
+        self.date_pattern = date_pattern
+        self.mindate = mindate  # if set, dates before this can't be selected in the popup calendar
+        self._date = initial_date or date.today()
+
+        self.entry = tk.Entry(
+            self, width=width, bg=FIELD_BG, fg=TEXT_COLOR, relief="flat",
+            font=("Arial", 11), bd=6, state="readonly", readonlybackground=FIELD_BG,
+            justify="center",
+        )
+        self.entry.pack(side="left")
+
+        self.button = tk.Button(
+            self, text="\U0001F4C5", command=self._open_picker, bg=FIELD_BG, fg=TEXT_COLOR,
+            relief="flat", width=3, activebackground=ACCENT_BLUE, activeforeground="white",
+        )
+        self.button.pack(side="left", padx=(3, 0))
+
+        self._refresh_entry_text()
+
+    def _refresh_entry_text(self) -> None:
+        self.entry.configure(state="normal")
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, self._date.strftime(self.date_pattern))
+        self.entry.configure(state="readonly")
+
+    def _open_picker(self) -> None:
+        popup = tk.Toplevel(self)
+        # Hidden until we've computed and applied its final position — this
+        # is what stops it from flashing at Tk's default spawn location
+        # (bottom-left corner, next to the taskbar/Start button on Windows)
+        # before jumping to where it's actually supposed to appear.
+        popup.withdraw()
+        popup.title("Select a date")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.winfo_toplevel())
+        popup.resizable(False, False)
+
+        # Show the currently selected date, unless it's before mindate (in
+        # which case open on mindate instead, so the calendar doesn't try
+        # to land on a month where the current selection isn't even valid).
+        shown_date = self._date
+        if self.mindate and shown_date < self.mindate:
+            shown_date = self.mindate
+
+        cal = Calendar(
+            popup, selectmode="day",
+            year=shown_date.year, month=shown_date.month, day=shown_date.day,
+            mindate=self.mindate,
+            background=FIELD_BG, foreground=TEXT_COLOR,
+            headersbackground=FIELD_BG, headersforeground=TEXT_COLOR,
+            normalbackground=FIELD_BG, normalforeground=TEXT_COLOR,
+            weekendbackground=FIELD_BG, weekendforeground=TEXT_COLOR,
+            othermonthbackground=BG_COLOR, othermonthforeground=TEXT_MUTED,
+            selectbackground=ACCENT_BLUE, selectforeground="white",
+            bordercolor=BG_COLOR,
+            disabledbackground=BG_COLOR, disabledforeground=TEXT_MUTED,
+        )
+        cal.pack(padx=10, pady=10)
+
+        def confirm():
+            self._date = cal.selection_get()
+            self._refresh_entry_text()
+            popup.destroy()
+
+        tk.Button(
+            popup, text="Select", command=confirm, bg=ACCENT_BLUE, fg="white",
+            relief="flat", font=("Arial", 10, "bold"),
+        ).pack(pady=(0, 10))
+
+        # Now that every widget is built, compute the popup's final size
+        # and position it just below the calendar button, BEFORE showing it.
+        popup.update_idletasks()
+        x = self.button.winfo_rootx()
+        y = self.button.winfo_rooty() + self.button.winfo_height()
+
+        # Keep the popup on-screen if the button is near the right/bottom
+        # edge, instead of letting part of it render off the visible display.
+        screen_w = popup.winfo_screenwidth()
+        screen_h = popup.winfo_screenheight()
+        popup_w = popup.winfo_reqwidth()
+        popup_h = popup.winfo_reqheight()
+        x = min(x, screen_w - popup_w)
+        y = min(y, screen_h - popup_h)
+
+        popup.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        popup.deiconify()
+        popup.grab_set()
+        popup.focus_set()
+
+    # --- API matching tkcalendar.DateEntry, so existing call sites don't need to change ---
+    def get(self) -> str:
+        return self._date.strftime(self.date_pattern)
+
+    def get_date(self) -> date:
+        return self._date
+
+    def set_date(self, d) -> None:
+        if isinstance(d, datetime):
+            d = d.date()
+        self._date = d
+        self._refresh_entry_text()
 
 
 class RestaurantApp:
@@ -288,7 +422,9 @@ class RestaurantApp:
         self.menu_price_entry.grid(row=0, column=3, padx=5)
 
         self._make_label(form, "Category:").grid(row=0, column=4, padx=5)
-        self.menu_category_combo = ttk.Combobox(form, state="readonly", width=10, values=["Food", "Drink"])
+        self.menu_category_combo = ttk.Combobox(
+            form, state="readonly", width=10, values=["Food", "Drink", "Dessert", "Appetizer"]
+        )
         self.menu_category_combo.set("Food")
         self.menu_category_combo.grid(row=0, column=5, padx=5)
 
@@ -353,7 +489,11 @@ class RestaurantApp:
         if result is None:
             return
         name, price, category = result
-        self.db.add_menu_item(name, price, category)
+        try:
+            self.db.add_menu_item(name, price, category)
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
         self.menu_name_entry.delete(0, tk.END)
         self.menu_price_entry.delete(0, tk.END)
         self.refresh_menu_items()
@@ -366,7 +506,11 @@ class RestaurantApp:
         if result is None:
             return
         name, price, category = result
-        self.db.update_menu_item(self.selected_menu_item_id, name, price, category)
+        try:
+            self.db.update_menu_item(self.selected_menu_item_id, name, price, category)
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
         self.refresh_menu_items()
 
     def delete_menu_item(self) -> None:
@@ -389,20 +533,30 @@ class RestaurantApp:
         form.pack(fill="x", padx=10, pady=10)
 
         self._make_label(form, "Table #:").grid(row=0, column=0, padx=5)
-        self.table_number_entry = self._make_entry(form, width=10)
+        self.table_number_entry = self._make_entry(form, width=8)
         self.table_number_entry.grid(row=0, column=1, padx=5)
 
         self._make_label(form, "Capacity:").grid(row=0, column=2, padx=5)
-        self.table_capacity_entry = self._make_entry(form, width=10)
+        self.table_capacity_entry = self._make_entry(form, width=8)
         self.table_capacity_entry.grid(row=0, column=3, padx=5)
 
-        self._make_button(form, "Add", self.add_table).grid(row=0, column=4, padx=5)
-        self._make_button(form, "Update selected", self.update_table).grid(row=0, column=5, padx=5)
-        self._make_button(form, "Delete selected", self.delete_table, bg=ACCENT_RED).grid(row=0, column=6, padx=5)
+        self._make_label(form, "Name (optional):").grid(row=0, column=4, padx=5)
+        # A few common presets, but editable — any nickname is fine (e.g. "Terrace 2").
+        self.table_name_combo = ttk.Combobox(
+            form, width=14, values=["Family", "Couple", "VIP", "Window", "Terrace", "Bar"]
+        )
+        self.table_name_combo.grid(row=0, column=5, padx=5)
 
-        self.tables_table = ttk.Treeview(parent, columns=("id", "number", "capacity"), show="headings", height=15)
+        self._make_button(form, "Add", self.add_table).grid(row=0, column=6, padx=5)
+        self._make_button(form, "Update selected", self.update_table).grid(row=0, column=7, padx=5)
+        self._make_button(form, "Delete selected", self.delete_table, bg=ACCENT_RED).grid(row=0, column=8, padx=5)
+
+        self.tables_table = ttk.Treeview(
+            parent, columns=("id", "number", "name", "capacity"), show="headings", height=15
+        )
         self.tables_table.heading("id", text="ID")
         self.tables_table.heading("number", text="Table #")
+        self.tables_table.heading("name", text="Name")
         self.tables_table.heading("capacity", text="Capacity (seats)")
         self.tables_table.column("id", width=60, anchor="center")
         self.tables_table.pack(fill="both", expand=True, padx=10, pady=10)
@@ -416,21 +570,25 @@ class RestaurantApp:
         self.selected_table_id = int(values[0])
         self.table_number_entry.delete(0, tk.END)
         self.table_number_entry.insert(0, values[1])
+        self.table_name_combo.set(values[2])
         self.table_capacity_entry.delete(0, tk.END)
-        self.table_capacity_entry.insert(0, values[2])
+        self.table_capacity_entry.insert(0, values[3])
 
     def refresh_tables(self) -> None:
         self.tables_table.delete(*self.tables_table.get_children())
         for table in self.db.list_tables():
-            self.tables_table.insert("", tk.END, values=(table.id, table.number, table.capacity))
+            self.tables_table.insert(
+                "", tk.END, values=(table.id, table.number, table.name or "", table.capacity)
+            )
         if hasattr(self, "reservation_table_combo"):
             self._refresh_reservation_comboboxes()
 
     def _read_table_form(self):
         number_raw = self.table_number_entry.get().strip()
         capacity_raw = self.table_capacity_entry.get().strip()
+        name = self.table_name_combo.get().strip()
         if not number_raw or not capacity_raw:
-            messagebox.showwarning("Error", "All fields are required.")
+            messagebox.showwarning("Error", "Table # and capacity are required.")
             return None
         if not number_raw.isdigit() or not capacity_raw.isdigit():
             messagebox.showerror("Error", "Table # and capacity must be whole numbers.")
@@ -439,20 +597,21 @@ class RestaurantApp:
         if capacity <= 0:
             messagebox.showerror("Error", "Capacity must be greater than zero.")
             return None
-        return number, capacity
+        return number, capacity, (name or None)
 
     def add_table(self) -> None:
         result = self._read_table_form()
         if result is None:
             return
-        number, capacity = result
+        number, capacity, name = result
         try:
-            self.db.add_table(number, capacity)
+            self.db.add_table(number, capacity, name)
         except Exception:
             messagebox.showerror("Error", f"Table #{number} already exists.")
             return
         self.table_number_entry.delete(0, tk.END)
         self.table_capacity_entry.delete(0, tk.END)
+        self.table_name_combo.set("")
         self.refresh_tables()
 
     def update_table(self) -> None:
@@ -462,8 +621,8 @@ class RestaurantApp:
         result = self._read_table_form()
         if result is None:
             return
-        number, capacity = result
-        self.db.update_table(self.selected_table_id, number, capacity)
+        number, capacity, name = result
+        self.db.update_table(self.selected_table_id, number, capacity, name)
         self.refresh_tables()
 
     def delete_table(self) -> None:
@@ -475,6 +634,7 @@ class RestaurantApp:
             self.selected_table_id = None
             self.table_number_entry.delete(0, tk.END)
             self.table_capacity_entry.delete(0, tk.END)
+            self.table_name_combo.set("")
             self.refresh_tables()
             self.refresh_reservations()
 
@@ -494,8 +654,10 @@ class RestaurantApp:
         self.reservation_table_combo = ttk.Combobox(form, state="readonly", width=18)
         self.reservation_table_combo.grid(row=0, column=3, padx=5)
 
-        self._make_label(form, "Date (DD/MM/YYYY):").grid(row=0, column=4, padx=5)
-        self.reservation_date_entry = self._make_entry(form, width=12)
+        self._make_label(form, "Date:").grid(row=0, column=4, padx=5)
+        self.reservation_date_entry = SimpleDatePicker(
+            form, date_pattern="%d/%m/%Y", width=11, mindate=date.today()
+        )
         self.reservation_date_entry.grid(row=0, column=5, padx=5)
 
         self._make_label(form, "Time (HH:MM):").grid(row=1, column=4, padx=5, pady=3)
@@ -563,8 +725,16 @@ class RestaurantApp:
 
     def _refresh_reservation_comboboxes(self) -> None:
         self.reservation_customers_by_name = {c.name: c.id for c in self.db.list_customers()}
+
+        def table_label(t):
+            nickname = f" – {t.name}" if t.name else ""
+            return f"Table {t.number}{nickname} (seats {t.capacity})"
+
+        # Store (id, capacity) together instead of parsing the capacity back
+        # out of the label text later — much less fragile once names can
+        # contain arbitrary text (including words like "seats" or parens).
         self.reservation_tables_by_label = {
-            f"Table {t.number} (seats {t.capacity})": t.id for t in self.db.list_tables()
+            table_label(t): (t.id, t.capacity) for t in self.db.list_tables()
         }
         self.reservation_customer_combo["values"] = list(self.reservation_customers_by_name.keys())
         self.reservation_table_combo["values"] = list(self.reservation_tables_by_label.keys())
@@ -648,21 +818,31 @@ class RestaurantApp:
         # the app validates dates, instead of letting a bad string slip
         # silently into the database.
         try:
-            datetime.strptime(date_raw, "%d/%m/%Y")
-            datetime.strptime(time_raw, "%H:%M")
+            reservation_datetime = datetime.strptime(f"{date_raw} {time_raw}", "%d/%m/%Y %H:%M")
         except ValueError:
             messagebox.showerror("Error", "Date must be DD/MM/YYYY and time must be HH:MM.")
             return
 
+        # No booking in the past, and no booking for "right now" either —
+        # require at least MIN_BOOKING_LEAD_TIME notice (2 hours by default).
+        earliest_allowed = datetime.now() + MIN_BOOKING_LEAD_TIME
+        if reservation_datetime < earliest_allowed:
+            messagebox.showerror(
+                "Error",
+                f"Reservations must be made at least {int(MIN_BOOKING_LEAD_TIME.total_seconds() // 3600)} "
+                f"hour(s) in advance. The earliest available slot is "
+                f"{earliest_allowed.strftime('%d/%m/%Y %H:%M')}.",
+            )
+            return
+
         customer_id = self.reservation_customers_by_name[customer_name]
-        table_id = self.reservation_tables_by_label[table_label]
+        table_id, table_capacity = self.reservation_tables_by_label[table_label]
         guests = int(guests_raw)
 
         if self.db.is_table_booked(table_id, date_raw, time_raw):
             messagebox.showerror("Error", "This table is already booked at that date and time.")
             return
 
-        table_capacity = int(table_label.split("seats ")[1].rstrip(")"))
         if guests > table_capacity:
             if not messagebox.askyesno(
                 "Capacity warning",
@@ -678,7 +858,7 @@ class RestaurantApp:
 
         self.pending_preorder_items = []
         self._refresh_preorder_cart_view()
-        self.reservation_date_entry.delete(0, tk.END)
+        self.reservation_date_entry.set_date(datetime.now())
         self.reservation_time_entry.delete(0, tk.END)
         self.reservation_guests_entry.delete(0, tk.END)
 
@@ -790,8 +970,8 @@ class RestaurantApp:
     # ANALYSIS TAB
     # ==================================================================
     def _build_analysis_tab(self, parent) -> None:
-        # The Analysis tab now has a lot of content (stats, tables, charts),
-        # so it's wrapped in a scrollable canvas — the same pattern used for
+        # The Analysis tab has a lot of content (filters, stats, tables,
+        # charts), so it's wrapped in a scrollable canvas — same pattern as
         # the booking form — instead of forcing the whole window taller.
         canvas = tk.Canvas(parent, borderwidth=0, bg=BG_COLOR, highlightthickness=0)
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
@@ -800,31 +980,79 @@ class RestaurantApp:
         canvas.pack(side="left", fill="both", expand=True)
 
         content = tk.Frame(canvas, bg=BG_COLOR)
-        canvas.create_window((0, 0), window=content, anchor="nw")
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
         content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
-        # ----- Headline stats, row 1 -----
-        stats_frame = tk.Frame(content, bg=BG_COLOR)
-        stats_frame.pack(fill="x", padx=10, pady=(10, 2))
+        # RESPONSIVE: the inner content frame is stretched to always match
+        # the canvas's current width, so widgets packed with fill="x"/"both"
+        # actually reflow when the window is resized, instead of staying
+        # pinned to whatever width they had when first drawn.
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
 
-        self.stat_top_customer_label = self._make_label(stats_frame, "Top customer: —", font=("Arial", 12, "bold"))
+        # MOUSE WHEEL SCROLLING: bind only while the pointer is actually
+        # over this canvas (bind_all + unbind_all on Enter/Leave), so
+        # scrolling here doesn't hijack the mouse wheel on other tabs.
+        # <MouseWheel> covers Windows and macOS (trackpad two-finger
+        # scroll included); <Button-4>/<Button-5> cover Linux.
+        def _on_mousewheel(event):
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        def _bind_mousewheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+
+        # No filter applied until the person picks one — None/None means
+        # "all time" everywhere in refresh_analysis().
+        self.analysis_start_date = None
+        self.analysis_end_date = None
+
+        # ----- Date filter -----
+        self._build_analysis_filter(content)
+
+        # ----- Headline stats -----
+        stats_frame = tk.Frame(content, bg=BG_COLOR)
+        stats_frame.pack(fill="x", padx=10, pady=(5, 2))
+        stats_frame.grid_columnconfigure((0, 1, 2), weight=1)  # responsive: columns share extra width equally
+
+        # wraplength: at narrow window widths these labels would otherwise
+        # overflow horizontally into the neighboring column instead of
+        # wrapping onto a second line.
+        self.stat_top_customer_label = self._make_label(stats_frame, "Top customer: —", font=("Arial", 12, "bold"), wraplength=280, justify="left")
         self.stat_top_customer_label.grid(row=0, column=0, padx=15, pady=3, sticky="w")
 
-        self.stat_top_food_label = self._make_label(stats_frame, "Most sold food: —", font=("Arial", 12, "bold"))
-        self.stat_top_food_label.grid(row=0, column=1, padx=15, pady=3, sticky="w")
+        self.stat_period_revenue_label = self._make_label(stats_frame, "Revenue (selected period): —", font=("Arial", 12, "bold"), wraplength=280, justify="left")
+        self.stat_period_revenue_label.grid(row=0, column=1, padx=15, pady=3, sticky="w")
 
-        self.stat_top_drink_label = self._make_label(stats_frame, "Most sold drink: —", font=("Arial", 12, "bold"))
-        self.stat_top_drink_label.grid(row=0, column=2, padx=15, pady=3, sticky="w")
+        self.stat_regulars_label = self._make_label(stats_frame, "Regular customers: —", font=("Arial", 12, "bold"), wraplength=280, justify="left")
+        self.stat_regulars_label.grid(row=0, column=2, padx=15, pady=3, sticky="w")
 
-        # ----- Headline stats, row 2 (revenue by period + segmentation) -----
-        self.stat_today_revenue_label = self._make_label(stats_frame, "Today: —", font=("Arial", 11))
+        self.stat_today_revenue_label = self._make_label(stats_frame, "Today: —", font=("Arial", 11), wraplength=280, justify="left")
         self.stat_today_revenue_label.grid(row=1, column=0, padx=15, pady=3, sticky="w")
 
-        self.stat_week_revenue_label = self._make_label(stats_frame, "This week: —", font=("Arial", 11))
+        self.stat_week_revenue_label = self._make_label(stats_frame, "This week: —", font=("Arial", 11), wraplength=280, justify="left")
         self.stat_week_revenue_label.grid(row=1, column=1, padx=15, pady=3, sticky="w")
 
-        self.stat_regulars_label = self._make_label(stats_frame, "Regular customers: —", font=("Arial", 11))
-        self.stat_regulars_label.grid(row=1, column=2, padx=15, pady=3, sticky="w")
+        self.stat_alltime_revenue_label = self._make_label(stats_frame, "All-time: —", font=("Arial", 11), wraplength=280, justify="left")
+        self.stat_alltime_revenue_label.grid(row=1, column=2, padx=15, pady=3, sticky="w")
+
+
+        # ----- Best sellers headline strip (one line per category, built dynamically) -----
+        self.bestseller_summary_frame = tk.Frame(content, bg=BG_COLOR)
+        self.bestseller_summary_frame.pack(fill="x", padx=10, pady=(0, 5))
 
         # ----- Action buttons -----
         actions_frame = tk.Frame(content, bg=BG_COLOR)
@@ -833,7 +1061,18 @@ class RestaurantApp:
         self._make_button(actions_frame, "Export to CSV", self.export_analysis_csv, bg=ACCENT_GREEN).pack(side="left", padx=5)
         self._make_button(actions_frame, "Export to PDF", self.export_analysis_pdf, bg=ACCENT_GREEN).pack(side="left", padx=5)
 
-        # ----- Top customers by spending (now with a Segment column) -----
+        # "Regular customer" threshold — configurable instead of a hardcoded
+        # constant, so different restaurants can decide what "regular"
+        # means for them (e.g. 3 orders for a small café vs. 10 for a busy
+        # place). Persisted in the database via app_settings.
+        self._make_label(actions_frame, "  Regular = ").pack(side="left", padx=(15, 2))
+        self.regular_threshold_entry = self._make_entry(actions_frame, width=4)
+        self.regular_threshold_entry.insert(0, str(self.db.get_regular_customer_threshold()))
+        self.regular_threshold_entry.pack(side="left")
+        self._make_label(actions_frame, "+ orders").pack(side="left", padx=(2, 5))
+        self._make_button(actions_frame, "Save", self.save_regular_threshold).pack(side="left", padx=5)
+
+        # ----- Top customers by spending (with Segment column) -----
         self._make_label(content, "Customers ranked by total spending:").pack(anchor="w", padx=10)
         self.analysis_customers_table = ttk.Treeview(
             content, columns=("phone", "name", "orders", "items", "spent", "segment"), show="headings", height=8,
@@ -846,53 +1085,14 @@ class RestaurantApp:
             self.analysis_customers_table.column(col, width=width, anchor="center")
         self.analysis_customers_table.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        # ----- Best sellers: food vs drink, side by side (exact numbers) -----
-        bestsellers_frame = tk.Frame(content, bg=BG_COLOR)
-        bestsellers_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # ----- Best sellers per category: table + chart, 2 per row, built dynamically -----
+        # Rebuilt on every refresh_analysis() call, since the set of
+        # categories can grow any time someone adds a new one on the
+        # Menu Items tab (e.g. adding "Appetizer" for the first time).
+        self.categories_frame = tk.Frame(content, bg=BG_COLOR)
+        self.categories_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        food_frame = tk.LabelFrame(
-            bestsellers_frame, text="Best-selling food", bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold")
-        )
-        food_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
-
-        self.analysis_food_table = ttk.Treeview(
-            food_frame, columns=("name", "quantity", "revenue"), show="headings", height=5,
-        )
-        for col, label, width in [("name", "Item", 160), ("quantity", "Qty Sold", 90), ("revenue", "Revenue", 100)]:
-            self.analysis_food_table.heading(col, text=label)
-            self.analysis_food_table.column(col, width=width, anchor="center")
-        self.analysis_food_table.pack(fill="both", expand=True, padx=5, pady=5)
-
-        drink_frame = tk.LabelFrame(
-            bestsellers_frame, text="Best-selling drinks", bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold")
-        )
-        drink_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-
-        self.analysis_drink_table = ttk.Treeview(
-            drink_frame, columns=("name", "quantity", "revenue"), show="headings", height=5,
-        )
-        for col, label, width in [("name", "Item", 160), ("quantity", "Qty Sold", 90), ("revenue", "Revenue", 100)]:
-            self.analysis_drink_table.heading(col, text=label)
-            self.analysis_drink_table.column(col, width=width, anchor="center")
-        self.analysis_drink_table.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # ----- Charts: top food / top drink quantities, side by side -----
-        charts_frame = tk.Frame(content, bg=BG_COLOR)
-        charts_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        self.food_chart_frame = tk.LabelFrame(
-            charts_frame, text="Top 5 food (chart)", bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold")
-        )
-        self.food_chart_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        self.food_fig, self.food_ax, self.food_canvas = self._make_embedded_chart(self.food_chart_frame)
-
-        self.drink_chart_frame = tk.LabelFrame(
-            charts_frame, text="Top 5 drinks (chart)", bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold")
-        )
-        self.drink_chart_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        self.drink_fig, self.drink_ax, self.drink_canvas = self._make_embedded_chart(self.drink_chart_frame)
-
-        # ----- Chart: revenue trend, last 7 days -----
+        # ----- Chart: revenue trend, last 7 days (always last-7-days, regardless of the filter above) -----
         self.trend_chart_frame = tk.LabelFrame(
             content, text="Revenue — last 7 days", bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold")
         )
@@ -901,15 +1101,153 @@ class RestaurantApp:
             self.trend_chart_frame, figsize=(9, 2.6)
         )
 
+    # ------------------------------------------------------------------
+    # Date filter (Day / Month / Year / Range / All time)
+    # ------------------------------------------------------------------
+    def _build_analysis_filter(self, parent) -> None:
+        filter_frame = tk.LabelFrame(
+            parent, text="Filter", bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold")
+        )
+        filter_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        self._make_label(filter_frame, "Period:").grid(row=0, column=0, padx=5, pady=6)
+        self.analysis_mode_combo = ttk.Combobox(
+            filter_frame, state="readonly", width=10,
+            values=["All time", "Day", "Month", "Year", "Range"],
+        )
+        self.analysis_mode_combo.set("All time")
+        self.analysis_mode_combo.grid(row=0, column=1, padx=5)
+        self.analysis_mode_combo.bind("<<ComboboxSelected>>", lambda e: self._update_analysis_filter_widgets())
+
+        # --- "Day" mode widget ---
+        self.analysis_day_picker = SimpleDatePicker(filter_frame, date_pattern="%Y-%m-%d", width=11)
+
+        # --- "Month" mode widgets ---
+        current_year = datetime.now().year
+        year_values = [str(y) for y in range(current_year - 5, current_year + 2)]
+
+        self.analysis_month_combo = ttk.Combobox(filter_frame, state="readonly", width=11, values=MONTH_NAMES)
+        self.analysis_month_combo.set(MONTH_NAMES[datetime.now().month - 1])
+        self.analysis_month_year_combo = ttk.Combobox(filter_frame, state="readonly", width=6, values=year_values)
+        self.analysis_month_year_combo.set(str(current_year))
+
+        # --- "Year" mode widget ---
+        self.analysis_year_combo = ttk.Combobox(filter_frame, state="readonly", width=6, values=year_values)
+        self.analysis_year_combo.set(str(current_year))
+
+        # --- "Range" mode widgets ---
+        self.analysis_range_from_label = self._make_label(filter_frame, "From:")
+        self.analysis_range_from = SimpleDatePicker(filter_frame, date_pattern="%Y-%m-%d", width=11)
+        self.analysis_range_to_label = self._make_label(filter_frame, "To:")
+        self.analysis_range_to = SimpleDatePicker(filter_frame, date_pattern="%Y-%m-%d", width=11)
+
+        self._make_button(filter_frame, "Apply Filter", self.apply_analysis_filter).grid(row=0, column=8, padx=5)
+        self._make_button(filter_frame, "Clear Filter", self.clear_analysis_filter).grid(row=0, column=9, padx=5)
+
+        self.analysis_filter_label = self._make_label(filter_frame, "Showing: All time", font=("Arial", 9))
+        self.analysis_filter_label.configure(fg=TEXT_MUTED)
+        self.analysis_filter_label.grid(row=1, column=0, columnspan=10, sticky="w", padx=5, pady=(0, 6))
+
+        self._update_analysis_filter_widgets()
+
+    def _update_analysis_filter_widgets(self) -> None:
+        """Shows only the sub-widgets relevant to the currently selected filter mode."""
+        mode = self.analysis_mode_combo.get()
+
+        # Hide everything first, then re-show only what this mode needs.
+        for widget in (
+            self.analysis_day_picker, self.analysis_month_combo, self.analysis_month_year_combo,
+            self.analysis_year_combo, self.analysis_range_from_label, self.analysis_range_from,
+            self.analysis_range_to_label, self.analysis_range_to,
+        ):
+            widget.grid_remove()
+
+        if mode == "Day":
+            self.analysis_day_picker.grid(row=0, column=2, padx=5)
+        elif mode == "Month":
+            self.analysis_month_combo.grid(row=0, column=2, padx=5)
+            self.analysis_month_year_combo.grid(row=0, column=3, padx=5)
+        elif mode == "Year":
+            self.analysis_year_combo.grid(row=0, column=2, padx=5)
+        elif mode == "Range":
+            self.analysis_range_from_label.grid(row=0, column=2, padx=(5, 0))
+            self.analysis_range_from.grid(row=0, column=3, padx=5)
+            self.analysis_range_to_label.grid(row=0, column=4, padx=(5, 0))
+            self.analysis_range_to.grid(row=0, column=5, padx=5)
+        # "All time" needs no extra widget.
+
+    def apply_analysis_filter(self) -> None:
+        mode = self.analysis_mode_combo.get()
+
+        if mode == "All time":
+            self.analysis_start_date = None
+            self.analysis_end_date = None
+            label = "All time"
+
+        elif mode == "Day":
+            picked = self.analysis_day_picker.get_date()
+            self.analysis_start_date = self.analysis_end_date = picked.isoformat()
+            label = picked.strftime("%d %b %Y")
+
+        elif mode == "Month":
+            month_index = MONTH_NAMES.index(self.analysis_month_combo.get()) + 1
+            year = int(self.analysis_month_year_combo.get())
+            last_day = calendar.monthrange(year, month_index)[1]
+            self.analysis_start_date = date(year, month_index, 1).isoformat()
+            self.analysis_end_date = date(year, month_index, last_day).isoformat()
+            label = f"{self.analysis_month_combo.get()} {year}"
+
+        elif mode == "Year":
+            year = int(self.analysis_year_combo.get())
+            self.analysis_start_date = f"{year}-01-01"
+            self.analysis_end_date = f"{year}-12-31"
+            label = year
+
+        else:  # "Range"
+            start_d = self.analysis_range_from.get_date()
+            end_d = self.analysis_range_to.get_date()
+            if start_d > end_d:
+                messagebox.showerror("Error", "The 'From' date must be on or before the 'To' date.")
+                return
+            self.analysis_start_date = start_d.isoformat()
+            self.analysis_end_date = end_d.isoformat()
+            label = f"{start_d.strftime('%d %b %Y')} \u2192 {end_d.strftime('%d %b %Y')}"
+
+        self.analysis_filter_label.configure(text=f"Showing: {label}")
+        self.refresh_analysis()
+
+    def clear_analysis_filter(self) -> None:
+        self.analysis_mode_combo.set("All time")
+        self._update_analysis_filter_widgets()
+        self.analysis_start_date = None
+        self.analysis_end_date = None
+        self.analysis_filter_label.configure(text="Showing: All time")
+        self.refresh_analysis()
+
+    def save_regular_threshold(self) -> None:
+        raw = self.regular_threshold_entry.get().strip()
+        if not raw.isdigit() or int(raw) < 1:
+            messagebox.showerror("Error", "The threshold must be a whole number of 1 or more.")
+            return
+        self.db.set_regular_customer_threshold(int(raw))
+        messagebox.showinfo(
+            "Saved",
+            f"Customers with {raw}+ orders will now be tagged 'Regular'.",
+        )
+        self.refresh_analysis()
+
+    # ------------------------------------------------------------------
+    # Charts
+    # ------------------------------------------------------------------
     def _make_embedded_chart(self, parent, figsize=(4.5, 3)):
         """Creates a matplotlib Figure/Axes styled for the dark theme, embedded in a tkinter frame."""
         fig = Figure(figsize=figsize, dpi=100, facecolor=FIELD_BG)
         ax = fig.add_subplot(111)
         self._style_dark_axes(ax)
-        canvas = FigureCanvasTkAgg(fig, master=parent)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
-        return fig, ax, canvas
+        chart_canvas = FigureCanvasTkAgg(fig, master=parent)
+        chart_canvas.draw()
+        chart_canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+        return fig, ax, chart_canvas
 
     @staticmethod
     def _style_dark_axes(ax) -> None:
@@ -921,56 +1259,7 @@ class RestaurantApp:
         ax.yaxis.label.set_color(TEXT_COLOR)
         ax.title.set_color(TEXT_COLOR)
 
-    def refresh_analysis(self) -> None:
-        # --- Top customers by spending (with Segment) ---
-        self.analysis_customers_table.delete(*self.analysis_customers_table.get_children())
-        spending_report = [row for row in self.db.customer_spending_report() if row.order_count > 0]
-        for row in spending_report:
-            self.analysis_customers_table.insert(
-                "", tk.END,
-                values=(row.phone_number, row.name, row.order_count, row.items_count,
-                        f"{row.total_spent:.2f}", row.segment),
-            )
-
-        if spending_report:
-            top = spending_report[0]
-            self.stat_top_customer_label.configure(text=f"Top customer: {top.name} ({top.total_spent:.2f} spent)")
-        else:
-            self.stat_top_customer_label.configure(text="Top customer: — (no orders yet)")
-
-        regular_count = sum(1 for row in spending_report if row.segment == "Regular")
-        self.stat_regulars_label.configure(text=f"Regular customers: {regular_count}")
-
-        # --- Revenue by period ---
-        self.stat_today_revenue_label.configure(text=f"Today: {self.db.revenue_today():.2f}")
-        self.stat_week_revenue_label.configure(text=f"This week: {self.db.revenue_this_week():.2f}")
-
-        # --- Best-selling food ---
-        self.analysis_food_table.delete(*self.analysis_food_table.get_children())
-        top_food = [row for row in self.db.top_selling_items(category="Food", limit=10) if row.quantity_sold > 0]
-        for row in top_food:
-            self.analysis_food_table.insert("", tk.END, values=(row.name, row.quantity_sold, f"{row.revenue:.2f}"))
-        if top_food:
-            self.stat_top_food_label.configure(text=f"Most sold food: {top_food[0].name} ({top_food[0].quantity_sold} sold)")
-        else:
-            self.stat_top_food_label.configure(text="Most sold food: — (no orders yet)")
-
-        # --- Best-selling drinks ---
-        self.analysis_drink_table.delete(*self.analysis_drink_table.get_children())
-        top_drinks = [row for row in self.db.top_selling_items(category="Drink", limit=10) if row.quantity_sold > 0]
-        for row in top_drinks:
-            self.analysis_drink_table.insert("", tk.END, values=(row.name, row.quantity_sold, f"{row.revenue:.2f}"))
-        if top_drinks:
-            self.stat_top_drink_label.configure(text=f"Most sold drink: {top_drinks[0].name} ({top_drinks[0].quantity_sold} sold)")
-        else:
-            self.stat_top_drink_label.configure(text="Most sold drink: — (no orders yet)")
-
-        # --- Charts ---
-        self._draw_bestseller_chart(self.food_ax, self.food_canvas, top_food[:5], "Food")
-        self._draw_bestseller_chart(self.drink_ax, self.drink_canvas, top_drinks[:5], "Drinks")
-        self._draw_revenue_trend_chart()
-
-    def _draw_bestseller_chart(self, ax, canvas, items, title) -> None:
+    def _draw_bestseller_chart(self, ax, chart_canvas, items, title) -> None:
         ax.clear()
         self._style_dark_axes(ax)
         if items:
@@ -981,8 +1270,8 @@ class RestaurantApp:
         else:
             ax.text(0.5, 0.5, "No sales yet", ha="center", va="center", color=TEXT_MUTED, transform=ax.transAxes)
         ax.set_title(f"Top {title} by quantity sold", fontsize=9)
-        canvas.figure.tight_layout()
-        canvas.draw()
+        chart_canvas.figure.tight_layout()
+        chart_canvas.draw()
 
     def _draw_revenue_trend_chart(self) -> None:
         self.trend_ax.clear()
@@ -995,7 +1284,105 @@ class RestaurantApp:
         self.trend_canvas.figure.tight_layout()
         self.trend_canvas.draw()
 
-    # ----- Exports -----
+    # ------------------------------------------------------------------
+    # Refresh
+    # ------------------------------------------------------------------
+    def refresh_analysis(self) -> None:
+        start, end = self.analysis_start_date, self.analysis_end_date
+
+        # --- Top customers by spending (with Segment) ---
+        self.analysis_customers_table.delete(*self.analysis_customers_table.get_children())
+        spending_report = [
+            row for row in self.db.customer_spending_report(start, end) if row.order_count > 0
+        ]
+        for row in spending_report:
+            self.analysis_customers_table.insert(
+                "", tk.END,
+                values=(row.phone_number, row.name, row.order_count, row.items_count,
+                        f"{row.total_spent:.2f}", row.segment),
+            )
+
+        if spending_report:
+            top = spending_report[0]
+            self.stat_top_customer_label.configure(text=f"Top customer: {top.name} ({top.total_spent:.2f} spent)")
+        else:
+            self.stat_top_customer_label.configure(text="Top customer: — (no orders in this period)")
+
+        regular_count = sum(1 for row in spending_report if row.segment == "Regular")
+        self.stat_regulars_label.configure(text=f"Regular customers: {regular_count}")
+
+        # --- Revenue stats: fixed reference points + the currently selected period ---
+        self.stat_today_revenue_label.configure(text=f"Today: {self.db.revenue_today():.2f}")
+        self.stat_week_revenue_label.configure(text=f"This week: {self.db.revenue_this_week():.2f}")
+        self.stat_alltime_revenue_label.configure(text=f"All-time: {self.db.total_revenue():.2f}")
+
+        period_revenue = self.db.revenue_for_period(start, end) if start and end else self.db.total_revenue()
+        self.stat_period_revenue_label.configure(text=f"Revenue (selected period): {period_revenue:.2f}")
+
+        # --- Best sellers per category (dynamic — Food/Drink/Dessert/Appetizer/... whatever exists) ---
+        self._rebuild_category_sections(start, end)
+
+        # --- 7-day trend chart (always the real last 7 days, independent of the filter above) ---
+        self._draw_revenue_trend_chart()
+
+    def _rebuild_category_sections(self, start, end) -> None:
+        # Torn down and rebuilt every refresh: cheap for the handful of
+        # categories a restaurant menu realistically has, and it means a
+        # brand new category (e.g. adding "Appetizer" for the first time)
+        # shows up automatically without any extra wiring.
+        for widget in self.categories_frame.winfo_children():
+            widget.destroy()
+        for widget in self.bestseller_summary_frame.winfo_children():
+            widget.destroy()
+
+        categories = self.db.list_categories()
+        self.categories_frame.grid_columnconfigure(0, weight=1)
+        self.categories_frame.grid_columnconfigure(1, weight=1)
+        self.bestseller_summary_frame.grid_columnconfigure((0, 1, 2), weight=1)
+
+        if not categories:
+            self._make_label(self.bestseller_summary_frame, "No menu items yet.").pack(side="left", padx=5)
+            return
+
+        for i, category in enumerate(categories):
+            items = [
+                row for row in self.db.top_selling_items(category=category, limit=10, start_date=start, end_date=end)
+                if row.quantity_sold > 0
+            ]
+
+            # Headline strip entry for this category
+            if items:
+                summary_text = f"Most sold {category}: {items[0].name} ({items[0].quantity_sold} sold)"
+            else:
+                summary_text = f"Most sold {category}: — (no sales in this period)"
+            # Grid instead of pack(side="left"): with several categories the
+            # labels would otherwise overflow past the visible width instead
+            # of wrapping. 3 per row, with the columns sharing extra width
+            # (responsive) via grid_columnconfigure below.
+            summary_label = self._make_label(self.bestseller_summary_frame, summary_text, font=("Arial", 11, "bold"), wraplength=280, justify="left")
+            summary_label.grid(row=i // 3, column=i % 3, padx=15, pady=3, sticky="w")
+
+            # Table + chart box for this category, 2 per row
+            box = tk.LabelFrame(
+                self.categories_frame, text=f"Best-selling {category}",
+                bg=BG_COLOR, fg=TEXT_COLOR, font=("Arial", 10, "bold"),
+            )
+            box.grid(row=i // 2, column=i % 2, sticky="nsew", padx=5, pady=5)
+
+            tree = ttk.Treeview(box, columns=("name", "quantity", "revenue"), show="headings", height=4)
+            for col, label, width in [("name", "Item", 150), ("quantity", "Qty Sold", 80), ("revenue", "Revenue", 90)]:
+                tree.heading(col, text=label)
+                tree.column(col, width=width, anchor="center")
+            for row in items:
+                tree.insert("", tk.END, values=(row.name, row.quantity_sold, f"{row.revenue:.2f}"))
+            tree.pack(fill="x", padx=5, pady=5)
+
+            fig, ax, chart_canvas = self._make_embedded_chart(box, figsize=(4.2, 2.6))
+            self._draw_bestseller_chart(ax, chart_canvas, items[:5], category)
+
+    # ------------------------------------------------------------------
+    # Exports
+    # ------------------------------------------------------------------
     def export_analysis_csv(self) -> None:
         path = filedialog.asksaveasfilename(
             defaultextension=".csv", filetypes=[("CSV files", "*.csv")], title="Save analysis report as CSV",
@@ -1003,32 +1390,34 @@ class RestaurantApp:
         if not path:
             return
 
-        spending_report = [row for row in self.db.customer_spending_report() if row.order_count > 0]
-        top_food = self.db.top_selling_items(category="Food", limit=20)
-        top_drinks = self.db.top_selling_items(category="Drink", limit=20)
+        start, end = self.analysis_start_date, self.analysis_end_date
+        spending_report = [row for row in self.db.customer_spending_report(start, end) if row.order_count > 0]
+        categories = self.db.list_categories()
 
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
+                writer.writerow(["Restaurant Analysis Report"])
+                writer.writerow(["Period", self.analysis_filter_label.cget("text").replace("Showing: ", "")])
+                writer.writerow([])
+
                 writer.writerow(["Customers ranked by total spending"])
                 writer.writerow(["Phone Number", "Name", "Orders", "Items Bought", "Total Spent", "Segment"])
                 for row in spending_report:
                     writer.writerow([row.phone_number, row.name, row.order_count, row.items_count,
                                       f"{row.total_spent:.2f}", row.segment])
 
-                writer.writerow([])
-                writer.writerow(["Best-selling food"])
-                writer.writerow(["Item", "Quantity Sold", "Revenue"])
-                for row in top_food:
-                    writer.writerow([row.name, row.quantity_sold, f"{row.revenue:.2f}"])
+                for category in categories:
+                    items = self.db.top_selling_items(category=category, limit=20, start_date=start, end_date=end)
+                    writer.writerow([])
+                    writer.writerow([f"Best-selling {category}"])
+                    writer.writerow(["Item", "Quantity Sold", "Revenue"])
+                    for row in items:
+                        writer.writerow([row.name, row.quantity_sold, f"{row.revenue:.2f}"])
 
                 writer.writerow([])
-                writer.writerow(["Best-selling drinks"])
-                writer.writerow(["Item", "Quantity Sold", "Revenue"])
-                for row in top_drinks:
-                    writer.writerow([row.name, row.quantity_sold, f"{row.revenue:.2f}"])
-
-                writer.writerow([])
+                period_revenue = self.db.revenue_for_period(start, end) if start and end else self.db.total_revenue()
+                writer.writerow(["Revenue (selected period)", f"{period_revenue:.2f}"])
                 writer.writerow(["Revenue today", f"{self.db.revenue_today():.2f}"])
                 writer.writerow(["Revenue this week", f"{self.db.revenue_this_week():.2f}"])
                 writer.writerow(["Revenue all-time", f"{self.db.total_revenue():.2f}"])
@@ -1056,9 +1445,9 @@ class RestaurantApp:
             )
             return
 
-        spending_report = [row for row in self.db.customer_spending_report() if row.order_count > 0]
-        top_food = self.db.top_selling_items(category="Food", limit=10)
-        top_drinks = self.db.top_selling_items(category="Drink", limit=10)
+        start, end = self.analysis_start_date, self.analysis_end_date
+        spending_report = [row for row in self.db.customer_spending_report(start, end) if row.order_count > 0]
+        categories = self.db.list_categories()
         styles = getSampleStyleSheet()
 
         def make_table(headers, rows):
@@ -1074,14 +1463,19 @@ class RestaurantApp:
             ]))
             return table
 
+        period_label = self.analysis_filter_label.cget("text").replace("Showing: ", "")
+        period_revenue = self.db.revenue_for_period(start, end) if start and end else self.db.total_revenue()
+
         try:
             doc = SimpleDocTemplate(path, pagesize=letter)
             elements = [
                 Paragraph("Restaurant Analysis Report", styles["Title"]),
                 Paragraph(f"Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Normal"]),
+                Paragraph(f"Period: {period_label}", styles["Normal"]),
                 Spacer(1, 16),
                 Paragraph(
-                    f"Revenue — today: {self.db.revenue_today():.2f} | "
+                    f"Revenue — selected period: {period_revenue:.2f} | "
+                    f"today: {self.db.revenue_today():.2f} | "
                     f"this week: {self.db.revenue_this_week():.2f} | "
                     f"all-time: {self.db.total_revenue():.2f}",
                     styles["Normal"],
@@ -1093,19 +1487,17 @@ class RestaurantApp:
                     [[r.phone_number, r.name, r.order_count, r.items_count, f"{r.total_spent:.2f}", r.segment]
                      for r in spending_report],
                 ),
-                Spacer(1, 16),
-                Paragraph("Best-selling food", styles["Heading2"]),
-                make_table(
-                    ["Item", "Quantity Sold", "Revenue"],
-                    [[r.name, r.quantity_sold, f"{r.revenue:.2f}"] for r in top_food],
-                ),
-                Spacer(1, 16),
-                Paragraph("Best-selling drinks", styles["Heading2"]),
-                make_table(
-                    ["Item", "Quantity Sold", "Revenue"],
-                    [[r.name, r.quantity_sold, f"{r.revenue:.2f}"] for r in top_drinks],
-                ),
             ]
+
+            for category in categories:
+                items = self.db.top_selling_items(category=category, limit=10, start_date=start, end_date=end)
+                elements.append(Spacer(1, 16))
+                elements.append(Paragraph(f"Best-selling {category}", styles["Heading2"]))
+                elements.append(make_table(
+                    ["Item", "Quantity Sold", "Revenue"],
+                    [[r.name, r.quantity_sold, f"{r.revenue:.2f}"] for r in items],
+                ))
+
             doc.build(elements)
         except OSError as e:
             messagebox.showerror("Error", f"Could not save the PDF file: {e}")

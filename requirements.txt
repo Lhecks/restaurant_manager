@@ -1,8 +1,9 @@
 # Runtime dependencies
 # tkinter and sqlite3 are part of the Python standard library — nothing to
-# install for those. The Analysis tab needs the two below.
+# install for those. The Analysis and Reservations tabs need the three below.
 matplotlib>=3.8
 reportlab>=4.0
+tkcalendar>=1.6
 
 # Development / testing dependencies
 pytest>=8.0
